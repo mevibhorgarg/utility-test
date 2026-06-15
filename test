@@ -1,0 +1,513 @@
+
+/* =====================================================================================
+ * 1) Constants.java
+ * ===================================================================================== */
+
+public static final String COUNT_MESSAGES_BY_TIME_TASK     = "COUNT_MESSAGES_BY_TIME_TASK";
+public static final String SEARCH_MESSAGE_BY_TEXT_TIME_TASK = "SEARCH_MESSAGE_BY_TEXT_TIME_TASK";
+
+public static final String FROM_TIME_PARAM   = "fromTime";
+public static final String TO_TIME_PARAM     = "toTime";
+public static final String EXACT_PARAM       = "exact";
+public static final String SEARCH_TEXT_PARAM = "searchText";
+
+public static final int DEFAULT_MAX_RESULTS = 500;   // default payload size for text search; not enforced as a hard cap
+
+
+
+// -------- Feature 1: count by time range --------
+@PostMapping("/countMessagesByTimeRange/{topic}")
+@Operation(
+        summary = "Schedule a task to count messages in a topic within a time window",
+        description = "Counts messages produced between fromTime and toTime. By default (exact=false) "
+                + "this uses offset metadata (end-offset minus start-offset per partition) and is near-instant; "
+                + "on compacted topics this counts offsets assigned in the window (approx. writes), not surviving "
+                + "records. With exact=true it scans and counts the actual records in the window.")
+@ApiResponses(value = {
+        @ApiResponse(responseCode = "202", description = "Task scheduled successfully."),
+        @ApiResponse(responseCode = "400", description = "Invalid request (missing or mis-ordered times)."),
+        @ApiResponse(responseCode = "500", description = "Internal server error while scheduling the task."),
+        @ApiResponse(responseCode = "503", description = "Task queue is full.")
+})
+public ResponseEntity<?> countMessagesByTimeRange(
+        @Parameter(description = "Kafka topic to count") @PathVariable String topic,
+        @io.swagger.v3.oas.annotations.parameters.RequestBody(
+                content = @Content(examples = @ExampleObject(
+                        name = "EST/EDT business-hours window",
+                        value = """
+                                {
+                                  "fromTime": "2026-06-13T09:00:00-04:00",
+                                  "toTime":   "2026-06-13T17:00:00-04:00",
+                                  "exact":    false
+                                }"""))
+        )
+        @RequestBody String requestBody) {
+
+    UUID uuid = UUID.randomUUID();
+    LogUtil.logTaskScheduled(uuid, Constants.COUNT_MESSAGES_BY_TIME_TASK, topic, null, requestBody);
+
+    try {
+        // --- light validation: times present, parseable, ordered ---
+        JsonNode body = mapper.readTree(requestBody);
+        long fromMillis = TimeUtil.toEpochMillis(body.path(Constants.FROM_TIME_PARAM).asText());
+        long toMillis   = TimeUtil.toEpochMillis(body.path(Constants.TO_TIME_PARAM).asText());
+        if (fromMillis >= toMillis) {
+            return ResponseEntity.badRequest().body("fromTime must be before toTime.");
+        }
+
+        boolean taskAdded = taskQueue.offer(new KafkaTask(
+                uuid.toString(), Constants.COUNT_MESSAGES_BY_TIME_TASK, topic, null, requestBody));
+
+        if (taskAdded) {
+            TaskCacheUtil.putNewTask(taskResultCache, uuid.toString(),
+                    Constants.COUNT_MESSAGES_BY_TIME_TASK, topic, null, requestBody);
+            log.info("/countMessagesByTimeRange task successfully scheduled.\n\ttaskId=" + uuid
+                    + "\n\nVisit /ui/tasks for task status and results.");
+            return ResponseEntity.accepted()
+                    .header(HttpHeaders.LOCATION, "/ui/tasks")
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .body("Task queued. taskId=" + uuid);
+        } else {
+            LogUtil.logTaskQueueFull(uuid, Constants.COUNT_MESSAGES_BY_TIME_TASK, topic, null, requestBody);
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body("Task queue is currently full. Please try again later.");
+        }
+    } catch (IllegalArgumentException ex) {           // bad/blank timestamp from TimeUtil
+        return ResponseEntity.badRequest().body(ex.getMessage());
+    } catch (Exception ex) {
+        LogUtil.logTaskError(Constants.COUNT_MESSAGES_BY_TIME_TASK, topic, null, requestBody, ex);
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body("Error encountered while scheduling /countMessagesByTimeRange for topic '" + topic + "'.");
+    }
+}
+
+// -------- Feature 2: text search by time range --------
+@PostMapping("/searchByTextTimeRange/{topic}")
+@Operation(
+        summary = "Schedule a task to find messages containing a text fragment within a time window",
+        description = "Seeks to the start offset for fromTime per partition and scans forward to toTime, "
+                + "matching searchText as a case-insensitive substring of the raw message value. Returns matching "
+                + "partition/offset locations (pair with getMessagesByPartitionOffsets to fetch full content).")
+@ApiResponses(value = {
+        @ApiResponse(responseCode = "202", description = "Task scheduled successfully."),
+        @ApiResponse(responseCode = "400", description = "Invalid request (blank searchText, or missing/mis-ordered times)."),
+        @ApiResponse(responseCode = "500", description = "Internal server error while scheduling the task."),
+        @ApiResponse(responseCode = "503", description = "Task queue is full.")
+})
+public ResponseEntity<?> searchByTextTimeRange(
+        @Parameter(description = "Kafka topic to search") @PathVariable String topic,
+        @io.swagger.v3.oas.annotations.parameters.RequestBody(
+                content = @Content(examples = @ExampleObject(
+                        name = "Search within an EST/EDT window",
+                        value = """
+                                {
+                                  "searchText": "orderId",
+                                  "fromTime":   "2026-06-13T09:00:00-04:00",
+                                  "toTime":     "2026-06-13T17:00:00-04:00",
+                                  "maxResults": 500
+                                }"""))
+        )
+        @RequestBody String requestBody) {
+
+    UUID uuid = UUID.randomUUID();
+    LogUtil.logTaskScheduled(uuid, Constants.SEARCH_MESSAGE_BY_TEXT_TIME_TASK, topic, null, requestBody);
+
+    try {
+        // --- light validation: searchText not blank; times present, parseable, ordered ---
+        JsonNode body = mapper.readTree(requestBody);
+        String searchText = body.path(Constants.SEARCH_TEXT_PARAM).asText();
+        if (searchText == null || searchText.isBlank()) {
+            return ResponseEntity.badRequest().body("searchText must not be blank.");
+        }
+        long fromMillis = TimeUtil.toEpochMillis(body.path(Constants.FROM_TIME_PARAM).asText());
+        long toMillis   = TimeUtil.toEpochMillis(body.path(Constants.TO_TIME_PARAM).asText());
+        if (fromMillis >= toMillis) {
+            return ResponseEntity.badRequest().body("fromTime must be before toTime.");
+        }
+
+        boolean taskAdded = taskQueue.offer(new KafkaTask(
+                uuid.toString(), Constants.SEARCH_MESSAGE_BY_TEXT_TIME_TASK, topic, null, requestBody));
+
+        if (taskAdded) {
+            TaskCacheUtil.putNewTask(taskResultCache, uuid.toString(),
+                    Constants.SEARCH_MESSAGE_BY_TEXT_TIME_TASK, topic, null, requestBody);
+            log.info("/searchByTextTimeRange task successfully scheduled.\n\ttaskId=" + uuid
+                    + "\n\nVisit /ui/tasks for task status and results.");
+            return ResponseEntity.accepted()
+                    .header(HttpHeaders.LOCATION, "/ui/tasks")
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .body("Task queued. taskId=" + uuid);
+        } else {
+            LogUtil.logTaskQueueFull(uuid, Constants.SEARCH_MESSAGE_BY_TEXT_TIME_TASK, topic, null, requestBody);
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body("Task queue is currently full. Please try again later.");
+        }
+    } catch (IllegalArgumentException ex) {
+        return ResponseEntity.badRequest().body(ex.getMessage());
+    } catch (Exception ex) {
+        LogUtil.logTaskError(Constants.SEARCH_MESSAGE_BY_TEXT_TIME_TASK, topic, null, requestBody, ex);
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body("Error encountered while scheduling /searchByTextTimeRange for topic '" + topic + "'.");
+    }
+}
+
+
+/* =====================================================================================
+ * 3) TaskProcessorService.java
+ * ===================================================================================== */
+
+// ---- (a) switch branches in processTasks() ----
+case Constants.COUNT_MESSAGES_BY_TIME_TASK:
+    executeCountMessagesByTimeTask(task);
+    break;
+case Constants.SEARCH_MESSAGE_BY_TEXT_TIME_TASK:
+    executeSearchByTextTimeTask(task);
+    break;
+
+
+// ---- (b) execute methods (same shape as executeSearchMessageByJsonFieldsTask) ----
+
+/**
+ * Executes a task to count messages in a topic within a time window. Window bounds
+ * (fromTime/toTime as ISO-8601) and the exact flag are read from the task's request body.
+ * exact=false -> offset-span count; exact=true -> scans and counts records in the window.
+ */
+private void executeCountMessagesByTimeTask(KafkaTask task)
+        throws JsonProcessingException, ExecutionException, InterruptedException {
+
+    String topic = task.getTaskParameters().get(Constants.TOPIC_PARAM);
+
+    JsonNode body = mapper.readTree(task.getTaskParameters().get("requestBody"));
+    long fromMillis = TimeUtil.toEpochMillis(body.path(Constants.FROM_TIME_PARAM).asText());
+    long toMillis   = TimeUtil.toEpochMillis(body.path(Constants.TO_TIME_PARAM).asText());
+    boolean exact   = body.path(Constants.EXACT_PARAM).asBoolean(false);
+
+    long startTime = System.currentTimeMillis();
+    KafkaConsumerService.TimeCountResult countResult =
+            kafkaConsumerService.countMessagesByTimeRange(topic, fromMillis, toMillis, exact);
+    long duration = System.currentTimeMillis() - startTime;
+
+    Map<String, Object> metadata = createMetaDataMap(topic, duration);
+    metadata.put(Constants.FROM_TIME_PARAM, body.path(Constants.FROM_TIME_PARAM).asText());
+    metadata.put(Constants.TO_TIME_PARAM, body.path(Constants.TO_TIME_PARAM).asText());
+    metadata.put(Constants.EXACT_PARAM, exact);
+
+    Map<String, Object> responseData = new HashMap<>();
+    responseData.put("messageCount", countResult.getCount());
+    responseData.put("countType", countResult.getCountType());        // OFFSET_SPAN or EXACT_SCAN
+    responseData.put("compacted", countResult.isCompacted());
+    if (countResult.getNote() != null) {
+        responseData.put("note", countResult.getNote());
+    }
+    responseData.put("perPartition", countResult.getPerPartition());
+
+    cacheTaskResult(task.getTaskId(), metadata, responseData);
+}
+
+/**
+ * Executes a task to search for messages whose raw value contains the given text fragment,
+ * bounded to a time window. Stores matching partition/offset locations and execution duration.
+ */
+private void executeSearchByTextTimeTask(KafkaTask task)
+        throws JsonProcessingException, ExecutionException, InterruptedException {
+
+    String topic = task.getTaskParameters().get(Constants.TOPIC_PARAM);
+
+    JsonNode body = mapper.readTree(task.getTaskParameters().get("requestBody"));
+    String searchText = body.path(Constants.SEARCH_TEXT_PARAM).asText();
+    long fromMillis = TimeUtil.toEpochMillis(body.path(Constants.FROM_TIME_PARAM).asText());
+    long toMillis   = TimeUtil.toEpochMillis(body.path(Constants.TO_TIME_PARAM).asText());
+    int maxResults  = body.path("maxResults").asInt(Constants.DEFAULT_MAX_RESULTS);
+
+    long startTime = System.currentTimeMillis();
+    List<TopicMessage> messages =
+            kafkaConsumerService.searchByTextTimeRange(topic, searchText, fromMillis, toMillis, maxResults);
+    long duration = System.currentTimeMillis() - startTime;
+
+    Map<String, Object> metadata = createMetaDataMap(topic, duration);
+    metadata.put(Constants.SEARCH_TEXT_PARAM, searchText);
+    metadata.put(Constants.FROM_TIME_PARAM, body.path(Constants.FROM_TIME_PARAM).asText());
+    metadata.put(Constants.TO_TIME_PARAM, body.path(Constants.TO_TIME_PARAM).asText());
+
+    Map<String, Object> responseData = new HashMap<>();
+    responseData.put("messageCount", messages.size());
+    // We only care about the partitions and offsets for this task (same as JSON/text search)
+    responseData.put("messages", toPartitionOffsetList(messages));    // <-- refactor helper
+    cacheTaskResult(task.getTaskId(), metadata, responseData);
+}
+
+// ---- (c) refactor helper (your open to-do). Replace the duplicated stream/map block in
+//          executeSearchMessageByJsonFieldsTask and executeSearchMessagesByTextTask with:
+//              responseData.put("messages", toPartitionOffsetList(messages));
+private List<Map<String, Object>> toPartitionOffsetList(List<TopicMessage> messages) {
+    return messages.stream().map(message -> {
+        Map<String, Object> map = new HashMap<>();
+        map.put("partition", message.getPartition());
+        map.put("offset", message.getOffset());
+        return map;
+    }).toList();
+}
+
+
+/* =====================================================================================
+ * 4) KafkaConsumerService.java
+ *    Assumes existing fields: consumerFactory, mapper, executorService, maxPollCount,
+ *    initialTimeoutMs, incrementalTimeoutIncreaseMs, and helper getTopicPartitions(consumer, topic).
+ * ===================================================================================== */
+
+// ---- (a) sibling scan primitive: seek to startOffset, stop at endOffsetExclusive ----
+/**
+ * Processes a single Kafka partition starting at a given offset and stopping once the partition's
+ * position reaches endOffsetExclusive (or the adaptive empty-poll loop completes). Mirrors
+ * processPartition(...) but is bounded by an explicit offset range, for time-window features that
+ * have already resolved per-partition start/end offsets via offsetsForTimes().
+ *
+ * @param tp                  partition to process
+ * @param startOffset         offset to seek to (inclusive)
+ * @param endOffsetExclusive  stop once position reaches this (exclusive); Long.MAX_VALUE for no bound
+ * @param recordProcessor     applied to each polled batch, threading an accumulating result
+ * @param initialResult       initial accumulator value
+ */
+private <T> T processPartitionInRange(TopicPartition tp,
+                                      long startOffset,
+                                      long endOffsetExclusive,
+                                      BiFunction<ConsumerRecords<String, String>, T, T> recordProcessor,
+                                      T initialResult) {
+
+    T result = initialResult;
+
+    try (KafkaConsumer<String, String> partitionConsumer =
+                 (KafkaConsumer<String, String>) consumerFactory.createConsumer(
+                         "-partition-range-info-" + tp.partition())) {
+
+        partitionConsumer.assign(List.of(tp));
+        partitionConsumer.seek(tp, startOffset);          // the one real difference vs processPartition
+
+        int emptyPolls = 0;
+        Duration pollTimeout = Duration.ofMillis(initialTimeoutMs);
+
+        while (true) {
+            ConsumerRecords<String, String> records = partitionConsumer.poll(pollTimeout);
+
+            if (records.isEmpty()) {
+                emptyPolls++;
+                if (emptyPolls >= maxPollCount) break;
+                pollTimeout = pollTimeout.plus(Duration.ofMillis(incrementalTimeoutIncreaseMs));
+            } else {
+                emptyPolls = 0;
+                pollTimeout = Duration.ofMillis(initialTimeoutMs);
+                result = recordProcessor.apply(records, result);
+                if (partitionConsumer.position(tp) >= endOffsetExclusive) break;   // window end reached
+            }
+        }
+    }
+    return result;
+}
+
+// ---- (b) count by time range ----
+/**
+ * Counts messages in a topic between fromMillis and toMillis.
+ * exact=false -> offset-span: sum of (endOffset - startOffset) per partition via offsetsForTimes(). Near-instant.
+ *                On compacted topics this approximates writes, not surviving records.
+ * exact=true  -> scans each partition from its start offset to its end offset and counts records.
+ */
+public TimeCountResult countMessagesByTimeRange(String topic, long fromMillis, long toMillis, boolean exact)
+        throws ExecutionException, InterruptedException {
+
+    TimeCountResult result = new TimeCountResult();
+    result.setCountType(exact ? "EXACT_SCAN" : "OFFSET_SPAN");
+
+    try (KafkaConsumer<String, String> consumer =
+                 (KafkaConsumer<String, String>) consumerFactory.createConsumer("-time-count-info")) {
+
+        List<TopicPartition> partitions = getTopicPartitions(consumer, topic);
+
+        boolean compacted = isCompacted(topic);
+        result.setCompacted(compacted);
+
+        Map<TopicPartition, Long> startTsQuery = new HashMap<>();
+        Map<TopicPartition, Long> endTsQuery = new HashMap<>();
+        for (TopicPartition tp : partitions) {
+            startTsQuery.put(tp, fromMillis);
+            endTsQuery.put(tp, toMillis);
+        }
+        Map<TopicPartition, OffsetAndTimestamp> startOffsets = consumer.offsetsForTimes(startTsQuery);
+        Map<TopicPartition, OffsetAndTimestamp> endOffsets   = consumer.offsetsForTimes(endTsQuery);
+        Map<TopicPartition, Long> logEnd = consumer.endOffsets(partitions);
+
+        long total = 0;
+        Map<String, Long> perPartition = new HashMap<>();
+
+        for (TopicPartition tp : partitions) {
+            OffsetAndTimestamp startOat = startOffsets.get(tp);
+            if (startOat == null) {                       // nothing after fromMillis on this partition
+                perPartition.put("partition-" + tp.partition(), 0L);
+                continue;
+            }
+            long startOffset = startOat.offset();
+
+            OffsetAndTimestamp endOat = endOffsets.get(tp);
+            long endOffset = (endOat != null) ? endOat.offset() : logEnd.get(tp);
+
+            long span = Math.max(0, endOffset - startOffset);
+
+            if (!exact) {
+                perPartition.put("partition-" + tp.partition(), span);
+                total += span;
+            } else {
+                long counted = processPartitionInRange(
+                        tp, startOffset, endOffset,
+                        (records, acc) -> acc + records.count(),
+                        0L);
+                perPartition.put("partition-" + tp.partition(), counted);
+                total += counted;
+            }
+        }
+
+        result.setCount(total);
+        result.setPerPartition(perPartition);
+
+        if (compacted && !exact) {
+            result.setNote("Topic is compacted: count is the offset span in the window "
+                    + "(approx. writes), not surviving records. Use exact=true for a true record count.");
+        }
+    }
+    return result;
+}
+
+// ---- (c) text search by time range ----
+/**
+ * Finds messages whose raw value contains searchText (case-insensitive) between fromMillis and toMillis.
+ * Seeks to the fromMillis offset per partition, scans to the toMillis offset, returns up to maxResults matches.
+ */
+public List<TopicMessage> searchByTextTimeRange(String topic, String searchText,
+                                                long fromMillis, long toMillis, int maxResults)
+        throws ExecutionException, InterruptedException {
+
+    String needle = searchText.toLowerCase();
+
+    try (KafkaConsumer<String, String> consumer =
+                 (KafkaConsumer<String, String>) consumerFactory.createConsumer("-time-text-info")) {
+
+        List<TopicPartition> partitions = getTopicPartitions(consumer, topic);
+
+        Map<TopicPartition, Long> startTsQuery = new HashMap<>();
+        Map<TopicPartition, Long> endTsQuery = new HashMap<>();
+        for (TopicPartition tp : partitions) {
+            startTsQuery.put(tp, fromMillis);
+            endTsQuery.put(tp, toMillis);
+        }
+        Map<TopicPartition, OffsetAndTimestamp> startOffsets = consumer.offsetsForTimes(startTsQuery);
+        Map<TopicPartition, OffsetAndTimestamp> endOffsets   = consumer.offsetsForTimes(endTsQuery);
+        Map<TopicPartition, Long> logEnd = consumer.endOffsets(partitions);
+
+        List<CompletableFuture<List<TopicMessage>>> futures = new ArrayList<>();
+
+        for (TopicPartition tp : partitions) {
+            OffsetAndTimestamp startOat = startOffsets.get(tp);
+            if (startOat == null) {
+                continue;                                  // nothing after fromMillis on this partition
+            }
+            long startOffset = startOat.offset();
+            OffsetAndTimestamp endOat = endOffsets.get(tp);
+            long endOffset = (endOat != null) ? endOat.offset() : logEnd.get(tp);
+
+            futures.add(CompletableFuture.supplyAsync(() ->
+                    processPartitionInRange(
+                            tp, startOffset, endOffset,
+                            (records, acc) -> {
+                                for (ConsumerRecord<String, String> record : records) {
+                                    if (record.timestamp() > toMillis) continue;   // timestamp guard (records not perfectly ordered)
+                                    String value = record.value();
+                                    if (value != null && value.toLowerCase().contains(needle)) {
+                                        acc.add(new TopicMessage(
+                                                record.partition(), record.offset(),
+                                                record.key(), record.value(), record.timestamp()));
+                                    }
+                                }
+                                return acc;
+                            },
+                            new ArrayList<TopicMessage>()),
+                    executorService));
+        }
+
+        List<TopicMessage> allMatches = new ArrayList<>();
+        for (CompletableFuture<List<TopicMessage>> future : futures) {
+            allMatches.addAll(future.get());
+        }
+        // maxResults is a soft default for payload size, applied at the end
+        if (allMatches.size() > maxResults) {
+            return allMatches.subList(0, maxResults);
+        }
+        return allMatches;
+    }
+}
+
+// ---- compaction detection via AdminClient describeConfigs ----
+/**
+ * Returns true if the topic's cleanup.policy includes "compact".
+ * adminProps(): reuse however you already build admin/consumer config in this service.
+ */
+private boolean isCompacted(String topic) {
+    try (Admin admin = Admin.create(adminProps())) {
+        ConfigResource resource = new ConfigResource(ConfigResource.Type.TOPIC, topic);
+        Config config = admin.describeConfigs(List.of(resource)).all().get().get(resource);
+        ConfigEntry policy = config.get("cleanup.policy");
+        return policy != null && policy.value() != null && policy.value().contains("compact");
+    } catch (Exception e) {
+        log.warn("Could not determine cleanup.policy for topic {}; assuming not compacted", topic, e);
+        return false;
+    }
+}
+
+// ---- (d) result holder (static nested class, or its own model file) ----
+public static class TimeCountResult {
+    private long count;
+    private String countType;        // "OFFSET_SPAN" | "EXACT_SCAN"
+    private boolean compacted;
+    private String note;
+    private Map<String, Long> perPartition;
+
+    public long getCount() { return count; }
+    public void setCount(long count) { this.count = count; }
+    public String getCountType() { return countType; }
+    public void setCountType(String countType) { this.countType = countType; }
+    public boolean isCompacted() { return compacted; }
+    public void setCompacted(boolean compacted) { this.compacted = compacted; }
+    public String getNote() { return note; }
+    public void setNote(String note) { this.note = note; }
+    public Map<String, Long> getPerPartition() { return perPartition; }
+    public void setPerPartition(Map<String, Long> perPartition) { this.perPartition = perPartition; }
+}
+
+
+/* =====================================================================================
+ * 5) TimeUtil.java
+ *    Simple: require full ISO-8601 with offset. EDT=-04:00 (summer/now), EST=-05:00 (winter),
+ *    IST=+05:30, UTC=Z. One parse line; the offset in the string carries the timezone.
+ * ===================================================================================== */
+
+public final class TimeUtil {
+
+    private TimeUtil() {}
+
+    /**
+     * Parses an ISO-8601 timestamp that includes an offset (e.g. 2026-06-13T14:00:00-04:00,
+     * ...+05:30, or ...Z) into epoch milliseconds for Kafka's offsetsForTimes().
+     *
+     * @throws IllegalArgumentException if the value is blank or not a valid offset datetime.
+     */
+    public static long toEpochMillis(String isoOffsetDateTime) {
+        if (isoOffsetDateTime == null || isoOffsetDateTime.isBlank()) {
+            throw new IllegalArgumentException(
+                    "Timestamp is required (ISO-8601 with offset, e.g. 2026-06-13T14:00:00-04:00).");
+        }
+        try {
+            return OffsetDateTime.parse(isoOffsetDateTime).toInstant().toEpochMilli();
+        } catch (DateTimeParseException e) {
+            throw new IllegalArgumentException(
+                    "Invalid timestamp '" + isoOffsetDateTime + "'. Use ISO-8601 with offset, "
+                  + "e.g. EST/EDT 2026-06-13T14:00:00-04:00, IST ...+05:30, UTC ...Z.", e);
+        }
+    }
+}
